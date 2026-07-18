@@ -129,7 +129,7 @@ class CoordinateMapper:
                 parts.append(f"{name}:--")
             else:
                 fret, string = pos
-                parts.append(f"{name}:F{fret}S{string}")
+                parts.append(f"{name}:F{fret:.1f}S{string:.1f}")
         return " ".join(parts)
 
 

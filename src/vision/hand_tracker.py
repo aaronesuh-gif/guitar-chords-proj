@@ -1,9 +1,20 @@
 """
 hand_tracker.py
 ----------------
-Thin wrapper around MediaPipe Hands. Takes a raw camera frame and
-returns 21 3D hand landmarks (fingertip, knuckle, and joint positions)
-in both normalized [0,1] form and pixel form.
+Thin wrapper around MediaPipe's HandLandmarker (Tasks API). Takes a raw
+camera frame and returns 21 3D hand landmarks (fingertip, knuckle, and
+joint positions) in both normalized [0,1] form and pixel form.
+
+NOTE ON API VERSION:
+Google removed the legacy `mp.solutions.hands` API in recent MediaPipe
+releases (0.10.30+). This file uses the current replacement, the
+"Tasks" API (`mp.tasks.vision.HandLandmarker`), which requires a
+separate model file (hand_landmarker.task) downloaded once and stored
+locally. See the setup instructions below.
+
+SETUP (run once, from your project root):
+    curl -o models/hand_landmarker.task \
+      https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
 
 Usage:
     from src.vision.hand_tracker import HandTracker
@@ -13,9 +24,23 @@ Usage:
         fingertip = landmarks[HandTracker.INDEX_TIP]
 """
 
+import os
+import time
+
 import cv2
-import mediapipe as mp
 import numpy as np
+import mediapipe as mp
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import (
+    HandLandmarker,
+    HandLandmarkerOptions,
+    RunningMode,
+)
+
+
+DEFAULT_MODEL_PATH = os.path.join(
+    os.path.dirname(__file__), "../../models/hand_landmarker.task"
+)
 
 
 class HandTracker:
@@ -33,12 +58,24 @@ class HandTracker:
     FINGERTIPS = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
     FINGERTIP_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
 
+    # Connections between landmark indices, for drawing the hand skeleton.
+    # Same topology MediaPipe's old drawing_utils used internally.
+    CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
+        (0, 5), (5, 6), (6, 7), (7, 8),          # index
+        (5, 9), (9, 10), (10, 11), (11, 12),     # middle
+        (9, 13), (13, 14), (14, 15), (15, 16),   # ring
+        (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
+        (0, 17),                                  # palm base
+    ]
+
     def __init__(
         self,
         max_num_hands: int = 1,
         min_detection_confidence: float = 0.7,
         min_tracking_confidence: float = 0.5,
         static_image_mode: bool = False,
+        model_path: str = DEFAULT_MODEL_PATH,
     ):
         """
         Parameters
@@ -52,20 +89,37 @@ class HandTracker:
                         model. Lower values track through motion blur better
                         but may drift; raise if landmarks jitter.
         static_image_mode : set True only when running on individual still
-                        images (e.g. in build_dataset.py). False for video —
-                        it enables MediaPipe's faster tracking-based mode
-                        instead of running full detection every frame.
+                        images (e.g. in build_dataset.py). Uses IMAGE running
+                        mode (full detection every call). False for video —
+                        uses VIDEO running mode, which is faster because it
+                        tracks between frames instead of re-detecting fully.
+        model_path : path to the downloaded hand_landmarker.task file.
+                        See the module docstring for the download command.
         """
-        self.mp_hands = mp.solutions.hands
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"MediaPipe model not found at {model_path}\n"
+                f"Download it with:\n"
+                f"  curl -o {model_path} "
+                f"https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+                f"hand_landmarker/float16/1/hand_landmarker.task"
+            )
 
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=static_image_mode,
-            max_num_hands=max_num_hands,
-            min_detection_confidence=min_detection_confidence,
+        self.static_image_mode = static_image_mode
+        running_mode = RunningMode.IMAGE if static_image_mode else RunningMode.VIDEO
+
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=running_mode,
+            num_hands=max_num_hands,
+            min_hand_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
+        self.landmarker = HandLandmarker.create_from_options(options)
+
+        # VIDEO running mode requires monotonically increasing timestamps
+        # per call. We generate our own since frames don't carry one.
+        self._start_time = time.time()
 
     # ------------------------------------------------------------------
     # Public API
@@ -87,22 +141,17 @@ class HandTracker:
                     Returns None if no hand was detected in this frame.
         """
         h, w = frame.shape[:2]
-
-        # MediaPipe expects RGB, OpenCV gives BGR
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        if not results.multi_hand_landmarks:
+        result = self._detect(mp_image)
+
+        if not result.hand_landmarks:
             return None
 
         # Only take the first detected hand (max_num_hands=1 by default)
-        hand = results.multi_hand_landmarks[0]
-
-        landmarks = np.array([
-            [lm.x * w, lm.y * h, lm.z * w]  # scale z by width, MediaPipe convention
-            for lm in hand.landmark
-        ])
-
+        hand = result.hand_landmarks[0]
+        landmarks = np.array([[lm.x * w, lm.y * h, lm.z * w] for lm in hand])
         return landmarks
 
     def process_normalized(self, frame: np.ndarray) -> np.ndarray | None:
@@ -110,23 +159,21 @@ class HandTracker:
         Same as process(), but returns landmarks in MediaPipe's native
         normalized [0, 1] coordinate space instead of pixels.
 
-        Useful when you want coordinates independent of frame resolution
-        (e.g. for the feature vector fed to the classifier, since pixel
-        coordinates would make the model resolution-dependent).
-
         Returns
         -------
         landmarks : (21, 3) numpy array of (x, y, z) normalized to [0, 1]
                     Returns None if no hand was detected.
         """
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        if not results.multi_hand_landmarks:
+        result = self._detect(mp_image)
+
+        if not result.hand_landmarks:
             return None
 
-        hand = results.multi_hand_landmarks[0]
-        landmarks = np.array([[lm.x, lm.y, lm.z] for lm in hand.landmark])
+        hand = result.hand_landmarks[0]
+        landmarks = np.array([[lm.x, lm.y, lm.z] for lm in hand])
         return landmarks
 
     def get_fingertip_positions(
@@ -134,9 +181,7 @@ class HandTracker:
     ) -> dict[str, tuple[float, float]]:
         """
         Convenience method — extract just the 5 fingertip (x, y) pixel
-        positions as a labeled dict. Drops z since most downstream code
-        (coordinate_mapper.py) only needs 2D pixel position to project
-        through the homography.
+        positions as a labeled dict.
 
         Parameters
         ----------
@@ -151,35 +196,43 @@ class HandTracker:
             for name, idx in zip(self.FINGERTIP_NAMES, self.FINGERTIPS)
         }
 
-    def draw_landmarks(
-        self, frame: np.ndarray, landmarks_raw
-    ) -> np.ndarray:
+    def draw_landmarks(self, frame: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
         """
-        Draw the MediaPipe hand skeleton on a copy of the frame using
-        MediaPipe's built-in drawing utility. Requires the raw MediaPipe
-        result object, not the numpy array from process().
-
-        This is mainly for quick visual debugging — the real overlay
-        (Phase 6) draws a custom skeleton instead so it can be styled
-        and combined with the fretboard grid.
+        Draw the hand skeleton on a copy of the frame using pixel-space
+        landmarks from process(). Replaces the old drawing_utils helper,
+        which was tied to the removed solutions API.
         """
         out = frame.copy()
-        self.mp_drawing.draw_landmarks(
-            out,
-            landmarks_raw,
-            self.mp_hands.HAND_CONNECTIONS,
-            self.mp_drawing_styles.get_default_hand_landmarks_style(),
-            self.mp_drawing_styles.get_default_hand_connections_style(),
-        )
+        for a, b in self.CONNECTIONS:
+            pt_a = tuple(landmarks[a][:2].astype(int))
+            pt_b = tuple(landmarks[b][:2].astype(int))
+            cv2.line(out, pt_a, pt_b, (0, 200, 0), 2)
+        for x, y, _ in landmarks:
+            cv2.circle(out, (int(x), int(y)), 4, (0, 255, 0), -1)
         return out
 
     def close(self):
         """Release MediaPipe resources. Call when done, e.g. on app exit."""
-        self.hands.close()
+        self.landmarker.close()
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _detect(self, mp_image: "mp.Image"):
+        """
+        Run detection using the correct method for the configured
+        running mode. IMAGE mode is stateless (one-off images). VIDEO
+        mode requires an increasing millisecond timestamp per call.
+        """
+        if self.static_image_mode:
+            return self.landmarker.detect(mp_image)
+        timestamp_ms = int((time.time() - self._start_time) * 1000)
+        return self.landmarker.detect_for_video(mp_image, timestamp_ms)
 
 
 # ------------------------------------------------------------------
-# Standalone test — python src/vision/hand_tracker.py
+# Standalone test — python -m src.vision.hand_tracker
 # Shows live hand landmark detection with the skeleton drawn.
 # Prints fingertip pixel positions to terminal.
 # ------------------------------------------------------------------
@@ -192,27 +245,16 @@ if __name__ == "__main__":
 
     print("Showing hand landmarks. Press Q to quit.")
 
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Run raw MediaPipe here too, just for the built-in drawing utility
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = tracker.hands.process(rgb)
-
         display = frame.copy()
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(
-                    display, hand_landmarks, mp_hands.HAND_CONNECTIONS
-                )
-
         landmarks = tracker.process(frame)
+
         if landmarks is not None:
+            display = tracker.draw_landmarks(display, landmarks)
             tips = tracker.get_fingertip_positions(landmarks)
             y_offset = 20
             for name, (x, y) in tips.items():

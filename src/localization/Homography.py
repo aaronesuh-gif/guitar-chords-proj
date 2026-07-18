@@ -125,30 +125,29 @@ class HomographyComputer:
 
     def fretboard_to_fret_string(
         self, warped_x: float, warped_y: float
-    ) -> tuple[int, int]:
+    ) -> tuple[float, float]:
         """
         Convert a point in normalized fretboard space to a (fret, string)
-        integer pair.
+        pair — CONTINUOUS, not snapped to integers.
 
-        The normalized space spans [0, WARP_WIDTH] x [0, WARP_HEIGHT].
-        We divide evenly by n_frets and n_strings to get grid cells.
-
-        Parameters
-        ----------
-        warped_x : x coordinate in normalized fretboard space
-        warped_y : y coordinate in normalized fretboard space
+        Returning fractional values (e.g. string 2.6) instead of hard
+        integer bins preserves fine positional differences. This matters
+        most for chords that differ by a single string shift (A vs D):
+        integer snapping forces a borderline finger to one bin or the
+        other, destroying exactly the signal that separates those chords.
+        The MLP learns finer boundaries from continuous inputs.
 
         Returns
         -------
-        (fret, string) — both 1-indexed. Clamped to valid range.
+        (fret, string) — 1-indexed floats, clamped to valid range.
         """
-        fret = int(warped_x / WARP_WIDTH * self.n_frets) + 1
-        string = int(warped_y / WARP_HEIGHT * self.n_strings) + 1
+        fret = warped_x / WARP_WIDTH * self.n_frets + 1
+        string = warped_y / WARP_HEIGHT * self.n_strings + 1
 
-        fret = max(1, min(fret, self.n_frets))
-        string = max(1, min(string, self.n_strings))
+        fret = max(1.0, min(float(fret), float(self.n_frets)))
+        string = max(1.0, min(float(string), float(self.n_strings)))
 
-        return fret, string
+        return round(fret, 2), round(string, 2)
 
     # ------------------------------------------------------------------
     # Private helpers
