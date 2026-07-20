@@ -26,7 +26,7 @@ class ChordMLP(nn.Module):
         self,
         input_dim: int,
         num_classes: int,
-        hidden_dims: tuple[int, ...] = (64, 32),
+        hidden_dims: tuple[int, ...] = (128, 64),
         dropout: float = 0.2,
     ):
         """

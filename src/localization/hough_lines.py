@@ -86,7 +86,7 @@ class HoughDetector:
     # ------------------------------------------------------------------
 
     def detect(
-        self, edges: np.ndarray, frame_shape: tuple
+        self, edges: np.ndarray, frame_shape: tuple, roi: tuple | None = None
     ) -> tuple[list[Line], list[Line]]:
         """
         Run Hough detection, cluster duplicates, and split into frets/strings.
@@ -96,15 +96,46 @@ class HoughDetector:
         edges       : binary edge map from EdgeDetector.process()
         frame_shape : (height, width[, channels]) of the original frame —
                       used to compute line endpoints for drawing
+        roi         : optional (x1, y1, x2, y2) region of interest. When
+                      given, edges outside this box are masked out before
+                      detection. Restricting Hough to the area around the
+                      fretting hand removes background clutter (door
+                      frames, shelves, table edges) that otherwise
+                      corrupts fret/string line extraction.
 
         Returns
         -------
         frets   : list of Line objects for fret wires (roughly vertical)
         strings : list of Line objects for guitar strings (roughly horizontal)
         """
-        raw_lines = self._hough(edges)
-        if raw_lines is None:
+        if roi is not None:
+            x1, y1, x2, y2 = [int(v) for v in roi]
+            h, w = edges.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            mask = np.zeros_like(edges)
+            mask[y1:y2, x1:x2] = 255
+            edges = cv2.bitwise_and(edges, mask)
+
+        frets, strings = self._detect_at_threshold(edges, frame_shape, self.threshold)
+
+        # Adaptive retry: if a fixed threshold missed the lines (common
+        # when lighting is dim or strings are thin), retry once at a
+        # lower threshold before giving up on this frame.
+        if len(frets) < 2 or len(strings) < 2:
+            retry_threshold = max(30, int(self.threshold * 0.6))
+            frets, strings = self._detect_at_threshold(edges, frame_shape, retry_threshold)
+
+        return frets, strings
+
+    def _detect_at_threshold(
+        self, edges: np.ndarray, frame_shape: tuple, threshold: int
+    ) -> tuple[list[Line], list[Line]]:
+        """One detection pass at a specific Hough threshold."""
+        result = cv2.HoughLines(edges, self.rho, self.theta, threshold)
+        if result is None:
             return [], []
+        raw_lines = result[:, 0, :]
 
         lines = [self._to_line(r, t, frame_shape) for r, t in raw_lines]
         clustered = self._cluster(lines)
@@ -119,19 +150,6 @@ class HoughDetector:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
-
-    def _hough(self, edges: np.ndarray) -> np.ndarray | None:
-        """Run cv2.HoughLines and return raw (rho, theta) pairs or None."""
-        result = cv2.HoughLines(
-            edges,
-            self.rho,
-            self.theta,
-            self.threshold,
-        )
-        if result is None:
-            return None
-        # cv2.HoughLines returns shape (N, 1, 2) — squeeze to (N, 2)
-        return result[:, 0, :]
 
     def _to_line(self, rho: float, theta: float, frame_shape: tuple) -> Line:
         """

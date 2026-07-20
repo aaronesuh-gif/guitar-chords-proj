@@ -60,15 +60,19 @@ class OverlayRenderer:
         frets = pipeline_result.get("frets", [])
         strings = pipeline_result.get("strings", [])
 
-        # Layer 1 — full hand skeleton
+        # Layer 1 — subtle fretboard boundary (thin outline only, no grid)
+        if homography is not None and getattr(homography, "last_corners", None) is not None:
+            display = self._draw_fretboard_outline(display, homography.last_corners)
+
+        # Layer 2 — full hand skeleton
         if landmarks is not None:
             display = self._draw_skeleton(display, landmarks)
             display = self._draw_fingertip_labels(display, landmarks, positions)
 
-        # Layer 2 — chord name + confidence banner
+        # Layer 3 — chord name + confidence banner
         display = self._draw_chord_banner(display, pipeline_result)
 
-        # Layer 3 — stats panel (bottom-left)
+        # Layer 4 — stats panel (bottom-left)
         display = self._draw_stats_panel(display, pipeline_result, frets, strings)
 
         return display
@@ -76,6 +80,17 @@ class OverlayRenderer:
     # ------------------------------------------------------------------
     # Drawing helpers
     # ------------------------------------------------------------------
+
+    def _draw_fretboard_outline(self, frame: np.ndarray, corners: np.ndarray) -> np.ndarray:
+        """
+        Thin, dim outline of the detected fretboard region — enough to
+        confirm tracking is working, deliberately NOT a full grid.
+        Corners order from homography: [tl, tr, bl, br].
+        """
+        out = frame.copy()
+        pts = corners.astype(int)[[0, 1, 3, 2]]  # reorder to draw a closed quad
+        cv2.polylines(out, [pts], isClosed=True, color=(120, 200, 120), thickness=2, lineType=cv2.LINE_AA)
+        return out
 
     def _draw_skeleton(self, frame: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
         """Full 21-point hand skeleton with connections, brighter than the grid."""

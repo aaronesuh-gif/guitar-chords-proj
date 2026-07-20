@@ -30,18 +30,42 @@ WARP_HEIGHT = 300
 
 
 class HomographyComputer:
-    def __init__(self, n_frets: int = 5, n_strings: int = 6):
+    def __init__(self, n_frets: int = 5, n_strings: int = 6, corner_smoothing: float = 0.6):
         """
         Parameters
         ----------
         n_frets   : number of frets visible in frame. Used to compute
                     fret spacing in the normalized output space.
         n_strings : number of guitar strings (always 6 for standard guitar).
+        corner_smoothing : EMA factor for corner stabilization, 0-1.
+                    Higher = trust new detections more (less lag, more
+                    jitter). Lower = smoother but slower to follow
+                    guitar movement. 0.6 is a reasonable middle.
         """
         self.n_frets = n_frets
         self.n_strings = n_strings
+        self.corner_smoothing = corner_smoothing
         self.H: np.ndarray | None = None
         self.H_inv: np.ndarray | None = None
+
+        # Smoothed corner state (EMA across frames) — reduces the
+        # frame-to-frame homography jitter that made coordinates wobble
+        self._smoothed_corners: np.ndarray | None = None
+        self.last_corners: np.ndarray | None = None
+
+        # Actual detected line positions in warped space — used for
+        # accurate (non-uniform) fret/string mapping
+        self._fret_xs: np.ndarray | None = None
+        self._string_ys: np.ndarray | None = None
+
+        # Persistence: when detection fails for a frame, keep serving
+        # the last good H for up to this many frames instead of
+        # immediately dropping to None. Hough detection flickers
+        # frame-to-frame under real lighting; the guitar itself barely
+        # moves in 15 frames (~0.5s), so a briefly stale H is far
+        # better than no H.
+        self.max_stale_frames = 15
+        self._stale_count = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -72,11 +96,21 @@ class HomographyComputer:
         Both are None if not enough lines were detected.
         """
         if len(frets) < 2 or len(strings) < 2:
-            return None, None
+            return self._handle_detection_failure()
 
         corners_src = self._extract_corners(frets, strings)
-        if corners_src is None:
-            return None, None
+        if corners_src is None or not self._corners_valid(corners_src, frame_shape):
+            return self._handle_detection_failure()
+
+        self._stale_count = 0
+
+        # EMA smoothing on corners — stabilizes the homography across
+        # frames so mapped coordinates don't jitter with Hough noise.
+        if self._smoothed_corners is not None:
+            a = self.corner_smoothing
+            corners_src = a * corners_src + (1 - a) * self._smoothed_corners
+        self._smoothed_corners = corners_src
+        self.last_corners = corners_src
 
         corners_dst = self._destination_corners()
 
@@ -87,7 +121,64 @@ class HomographyComputer:
         H_inv = np.linalg.inv(H)
         self.H = H
         self.H_inv = H_inv
+
+        # Store the ACTUAL warped positions of each detected fret and
+        # string line — real fret spacing is geometric, not uniform, so
+        # mapping against true line positions is more accurate than
+        # dividing the warped space into equal bins.
+        self._compute_reference_positions(frets, strings)
+
         return H, H_inv
+
+    def _corners_valid(self, corners: np.ndarray, frame_shape: tuple) -> bool:
+        """
+        Sanity-check an extracted corner quad before trusting it.
+        Rejects degenerate results (tiny slivers, corners far outside
+        the frame, near-zero area) that would otherwise get blended
+        into the EMA and poison the smoothed homography for many
+        frames afterward.
+        """
+        h, w = frame_shape[:2]
+
+        # Corners shouldn't be wildly outside the frame — allow some
+        # margin since the neck can extend past the frame edge
+        margin = 0.5
+        xs, ys = corners[:, 0], corners[:, 1]
+        if (xs < -w * margin).any() or (xs > w * (1 + margin)).any():
+            return False
+        if (ys < -h * margin).any() or (ys > h * (1 + margin)).any():
+            return False
+
+        # Quad area must be a meaningful fraction of the frame —
+        # shoelace formula on [tl, tr, br, bl] ordering
+        tl, tr, bl, br = corners
+        quad = np.array([tl, tr, br, bl])
+        x, y = quad[:, 0], quad[:, 1]
+        area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+        if area < 0.01 * w * h:  # less than 1% of the frame = sliver
+            return False
+
+        return True
+
+    def _handle_detection_failure(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """
+        Called when this frame's line detection wasn't good enough to
+        compute a fresh H. Serves the previous H for up to
+        max_stale_frames, then invalidates everything so we don't keep
+        mapping against a fretboard position that's no longer accurate.
+        """
+        if self.H is not None and self._stale_count < self.max_stale_frames:
+            self._stale_count += 1
+            return self.H, self.H_inv
+
+        # Too stale — full reset
+        self.H = None
+        self.H_inv = None
+        self._smoothed_corners = None
+        self.last_corners = None
+        self._fret_xs = None
+        self._string_ys = None
+        return None, None
 
     def warp_point(
         self, point: tuple[float, float], H: np.ndarray
@@ -127,27 +218,83 @@ class HomographyComputer:
         self, warped_x: float, warped_y: float
     ) -> tuple[float, float]:
         """
-        Convert a point in normalized fretboard space to a (fret, string)
-        pair — CONTINUOUS, not snapped to integers.
+        Convert a point in normalized fretboard space to a continuous
+        (fret, string) pair.
 
-        Returning fractional values (e.g. string 2.6) instead of hard
-        integer bins preserves fine positional differences. This matters
-        most for chords that differ by a single string shift (A vs D):
-        integer snapping forces a borderline finger to one bin or the
-        other, destroying exactly the signal that separates those chords.
-        The MLP learns finer boundaries from continuous inputs.
+        When actual detected line positions are available, interpolates
+        against them (accurate — respects real geometric fret spacing).
+        Falls back to uniform division otherwise.
 
         Returns
         -------
         (fret, string) — 1-indexed floats, clamped to valid range.
         """
-        fret = warped_x / WARP_WIDTH * self.n_frets + 1
-        string = warped_y / WARP_HEIGHT * self.n_strings + 1
+        if self._fret_xs is not None and len(self._fret_xs) >= 2:
+            # Interpolate against real detected fret line x positions:
+            # a point at fret line i maps to i+1; between lines maps
+            # to a fractional value respecting actual spacing.
+            indices = np.arange(1, len(self._fret_xs) + 1, dtype=float)
+            fret = float(np.interp(warped_x, self._fret_xs, indices))
+            max_fret = float(len(self._fret_xs))
+        else:
+            fret = warped_x / WARP_WIDTH * self.n_frets + 1
+            max_fret = float(self.n_frets)
 
-        fret = max(1.0, min(float(fret), float(self.n_frets)))
-        string = max(1.0, min(float(string), float(self.n_strings)))
+        if self._string_ys is not None and len(self._string_ys) >= 2:
+            indices = np.arange(1, len(self._string_ys) + 1, dtype=float)
+            string = float(np.interp(warped_y, self._string_ys, indices))
+            max_string = float(len(self._string_ys))
+        else:
+            string = warped_y / WARP_HEIGHT * self.n_strings + 1
+            max_string = float(self.n_strings)
+
+        fret = max(1.0, min(fret, max_fret))
+        string = max(1.0, min(string, max_string))
 
         return round(fret, 2), round(string, 2)
+
+    def _compute_reference_positions(self, frets: list[Line], strings: list[Line]):
+        """
+        Warp each detected fret line and string line into normalized
+        space and store their sorted x (frets) / y (strings) positions.
+
+        For each fret line: intersect with the top and bottom strings,
+        warp both intersection points, average their x. For each string
+        line: intersect with the left/right frets, warp, average y.
+        """
+        top_string, bottom_string = strings[0], strings[-1]
+        left_fret, right_fret = frets[0], frets[-1]
+
+        fret_xs = []
+        for fret_line in frets:
+            pts = [
+                self._intersect(fret_line, top_string),
+                self._intersect(fret_line, bottom_string),
+            ]
+            xs = []
+            for pt in pts:
+                if pt is not None:
+                    wx, _ = self.warp_point(pt, self.H)
+                    xs.append(wx)
+            if xs:
+                fret_xs.append(float(np.mean(xs)))
+
+        string_ys = []
+        for string_line in strings:
+            pts = [
+                self._intersect(string_line, left_fret),
+                self._intersect(string_line, right_fret),
+            ]
+            ys = []
+            for pt in pts:
+                if pt is not None:
+                    _, wy = self.warp_point(pt, self.H)
+                    ys.append(wy)
+            if ys:
+                string_ys.append(float(np.mean(ys)))
+
+        self._fret_xs = np.array(sorted(fret_xs)) if len(fret_xs) >= 2 else None
+        self._string_ys = np.array(sorted(string_ys)) if len(string_ys) >= 2 else None
 
     # ------------------------------------------------------------------
     # Private helpers

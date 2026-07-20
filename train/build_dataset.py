@@ -29,6 +29,7 @@ from src.localization.homography import HomographyComputer
 from src.vision.hand_tracker import HandTracker
 from src.vision.coordinate_mapper import CoordinateMapper
 from src.vision.orientation import OrientationAnalyzer
+from src.classifier.feature_builder import build_landmark_feature_dict
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -58,13 +59,13 @@ class DatasetBuilder:
         self.n_frets = n_frets
         self.n_strings = n_strings
 
-        # Track why images get skipped — printed as a summary at the end,
-        # since silent data loss during dataset building is a common
-        # source of confusing downstream bugs.
+        # Track data quality — no_fretboard images are still INCLUDED
+        # (shape features carry them); the counter just tells you how
+        # often fretboard detection is failing on your photos.
         self.skip_reasons = {
-            "no_fretboard": 0,
-            "no_hand": 0,
-            "unreadable": 0,
+            "no_fretboard": 0,   # informational — these rows are kept
+            "no_hand": 0,        # skipped — no usable signal
+            "unreadable": 0,     # skipped — corrupt/unreadable file
         }
 
     # ------------------------------------------------------------------
@@ -144,40 +145,64 @@ class DatasetBuilder:
             self.skip_reasons["unreadable"] += 1
             return None
 
-        # Stage 1: fretboard localization
-        edges = self.edge_detector.process(frame)
-        frets, strings = self.hough_detector.detect(edges, frame.shape)
-        H, H_inv = self.homography.compute(frets, strings, frame.shape)
-
-        if H is None:
-            self.skip_reasons["no_fretboard"] += 1
-            return None
-
-        # Stage 2: hand landmarks
+        # Stage 1: hand landmarks — the only hard requirement.
+        # No hand = no usable training signal, skip.
         landmarks = self.tracker.process(frame)
         if landmarks is None:
             self.skip_reasons["no_hand"] += 1
             return None
 
-        # Stage 3: coordinate mapping (fret, string) per fingertip
+        # Stage 2: fretboard localization — OPTIONAL. If it fails, the
+        # fret/string features become zeros and the shape features
+        # carry the example. Including these images is important: live
+        # inference constantly encounters frames without a detected
+        # fretboard, so the model must be trained on that case too.
+        # Detection is focused on a ROI around the hand, matching what
+        # main.py does live.
+        edges = self.edge_detector.process(frame)
+        roi = self._hand_roi(landmarks, frame.shape)
+        frets, strings = self.hough_detector.detect(edges, frame.shape, roi=roi)
+        H, H_inv = self.homography.compute(frets, strings, frame.shape)
+        if H is None:
+            self.skip_reasons["no_fretboard"] += 1  # counted, but NOT skipped
+
+        # Stage 3: coordinate mapping (fret, string) per fingertip —
+        # returns None per finger when H is None, encoded as zeros
         positions = self.mapper.map_landmarks(landmarks)
 
-        # Stage 4: orientation / barre detection
+        # Stage 4: orientation / barre detection — needs at least one
+        # fret line for a reference direction; defaults kick in otherwise
         orientation_result = self.orientation.analyze_index_finger(landmarks, frets)
 
-        return self._build_row(chord_name, positions, orientation_result)
+        return self._build_row(chord_name, positions, orientation_result, landmarks)
+
+    @staticmethod
+    def _hand_roi(landmarks, frame_shape) -> tuple:
+        """Generous box around the hand — same expansion as main.py."""
+        h, w = frame_shape[:2]
+        xs, ys = landmarks[:, 0], landmarks[:, 1]
+        x1, x2 = xs.min(), xs.max()
+        y1, y2 = ys.min(), ys.max()
+        pad_x = (x2 - x1) * 1.5 + 40
+        pad_y = (y2 - y1) * 0.8 + 40
+        return (
+            max(0, x1 - pad_x), max(0, y1 - pad_y),
+            min(w, x2 + pad_x), min(h, y2 + pad_y),
+        )
 
     def _build_row(
         self,
         chord_name: str,
         positions: dict,
         orientation_result,
+        landmarks,
     ) -> dict:
         """
-        Assemble one CSV row from the mapped positions and orientation
-        result. Missing fingers (position=None, e.g. thumb/pinky often
-        aren't on the fretboard) are encoded as 0,0 — the classifier
-        learns to treat that as "not fretting" through training.
+        Assemble one CSV row from the mapped positions, orientation
+        result, and normalized landmark shape features. Missing fingers
+        (position=None, e.g. thumb/pinky often aren't on the fretboard)
+        are encoded as 0,0 — the classifier learns to treat that as
+        "not fretting" through training.
         """
         row = {"label": chord_name}
 
@@ -195,6 +220,9 @@ class DatasetBuilder:
             row["index_angle"] = 90.0  # default: not barre-like
             row["index_span"] = 0.0
             row["is_barre"] = 0
+
+        # Wrist-normalized hand shape features — homography-independent
+        row.update(build_landmark_feature_dict(landmarks))
 
         return row
 
